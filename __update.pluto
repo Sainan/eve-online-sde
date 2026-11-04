@@ -100,7 +100,9 @@ function gzexists(name)
 end
 
 function gzread(name)
-	return (crypto.decompress(io.contents(name..".gz")))
+	local cont = io.contents(name..".gz")
+	local uncompressed_size = "<I4":unpack(cont, -4)
+	return (crypto.decompress(cont, uncompressed_size))
 end
 
 --[[local rr = new FileRangeReader("../eve-online-static-data-3665151-jsonl.zip")
