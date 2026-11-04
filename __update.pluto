@@ -1,0 +1,138 @@
+local { crypto, json, socket } = require "*"
+
+class FileRangeReader
+	function __construct(public path)
+		self.fh = io.open(path, "rb")
+		assert(self.fh)
+	end
+
+	function getBody(start, end_)
+		local bytes = (end_ - start) + 1
+		assert(self.fh:seek("set", start) == start)
+		local body = self.fh:read(bytes)
+		assert(#body == bytes)
+		return body
+	end
+
+	function getFooter(bytes)
+		local file_length = self.fh:seek("end", -bytes) + bytes
+		return self.fh:read(bytes), file_length
+	end
+end
+
+class HttpRangeReader
+	function __construct(public host, public path)
+		self.s = socket.connect(host, 443)
+		assert(self.s)
+		assert(self.s:starttls(host))
+	end
+
+	function getBody(start, end_)
+		local bytes = (end_ - start) + 1
+		self.s:send($"GET {self.path} HTTP/1.1\r\nHost: {self.host}\r\nRange: bytes={start}-{end_}\r\n\r\n")
+		local body = self.s:recv():split("\r\n\r\n", 2)[2]
+		while bytes > #body do
+			body ..= self.s:recv()
+		end
+		return body
+	end
+
+	function getFooter(bytes)
+		self.s:send($"GET {self.path} HTTP/1.1\r\nHost: {self.host}\r\nRange: bytes=-{bytes}\r\n\r\n")
+		local [headers, body] = self.s:recv():split("\r\n\r\n", 2)
+		local file_length
+		for headers:split("\r\n") as line do
+			if line:startswith("Content-Range: ") then
+				file_length = tonumber(line:split("/")[2])
+			end
+		end
+		while bytes > #body do
+			body ..= self.s:recv()
+		end
+		return body, file_length
+	end
+end
+
+class PartialZipReader
+	function __construct(public rr)
+		self.files = {}
+		local footer, file_length = rr:getFooter(22)
+		local magic, _, central_directory_offset
+		magic, _, _, _, _, _, central_directory_offset = "<I4I2I2I2I2I4I4":unpack(footer)
+		assert(magic == 101010256)
+		local central_directory = rr:getBody(central_directory_offset, file_length - 23)
+		local i = 1
+		while i < #central_directory do
+			local compression_method, uncompressed_data_crc32, compressed_size, uncompressed_size, name_len, extra_len, comment_len, offset
+			magic, _, _, _, compression_method, _, _, uncompressed_data_crc32, compressed_size, uncompressed_size, name_len, extra_len, comment_len, _, _, _, offset, i = "<I4I2I2I2I2I2I2I4I4I4I2I2I2I2I2I4I4":unpack(central_directory, i)
+			assert(magic == 33639248)
+			local name = central_directory:sub(i, i + name_len - 1) i += name_len
+			i += extra_len
+			i += comment_len
+			self.files[name] = $object(compression_method, uncompressed_data_crc32, compressed_size, uncompressed_size, offset, name_len, extra_len)
+		end
+	end
+
+	function getFileContents(file)
+		local start = file.offset + 34 + file.name_len + file.extra_len
+		local cont = self.rr:getBody(start, start + file.compressed_size - 1)
+		assert(#cont == file.compressed_size)
+		--[[if file.compression_method == 8 then
+			cont = crypto.decompress(cont, file.uncompressed_size)
+		else
+			assert(file.compression_method == 0)
+		end
+		assert(#cont == file.uncompressed_size)]]
+		return cont
+	end
+end
+
+function gzwrite(zr, name, file)
+	io.contents(name..".gz", "\x1f\x8b" .. "<I1":pack(file.compression_method) .. "\x00\x00\x00\x00\x00\x00\x03" .. zr:getFileContents(file) .. "<I4I4":pack(file.uncompressed_data_crc32, file.uncompressed_size))
+end
+
+function gzfilesize(name)
+	return io.filesize(name..".gz") - 18
+end
+
+function gzexists(name)
+	return io.exists(name..".gz")
+end
+
+function gzread(name)
+	return (crypto.decompress(io.contents(name..".gz")))
+end
+
+--[[local rr = new FileRangeReader("../eve-online-static-data-3665151-jsonl.zip")
+local zr = new PartialZipReader(rr)
+for name, file in zr.files do
+	gzwrite(zr, name, file)
+end]]
+
+local local_build
+if gzexists("_sde.jsonl") then
+	local_build = json.decode(gzread("_sde.jsonl")).buildNumber
+end
+local rr = new HttpRangeReader("developers.eveonline.com")
+rr.s:send($"GET /static-data/tranquility/latest.jsonl HTTP/1.1\r\nHost: developers.eveonline.com\r\n\r\n")
+local data = rr.s:recv()
+while data:sub(-4) == "\r\n\r\n" do
+	data ..= rr.s:recv()
+end
+local remote_build = json.decode(data:split("\r\n\r\n", 2)[2]).buildNumber
+assert(remote_build)
+if local_build == remote_build then
+	print("Already up-to-date.")
+else
+	print("Indexing...")
+	rr.path = $"/static-data/tranquility/eve-online-static-data-{remote_build}-jsonl.zip"
+	local zr = new PartialZipReader(rr)
+	for name, file in zr.files do
+		if not gzexists(name) or gzfilesize(name) ~= file.compressed_size or crypto.crc32(gzread(name)) ~= file.uncompressed_data_crc32 then
+			print("Updating "..name.."...")
+			gzwrite(zr, name, file)
+		end
+	end
+	os.execute("git add .")
+	os.execute($"git commit -m \"build {remote_build}\"")
+end
