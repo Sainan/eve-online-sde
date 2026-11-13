@@ -1,8 +1,9 @@
 name: Update
 on:
   workflow_dispatch: {}
-  schedule:
-    - cron: '0 12 * * *'
+  # Cron here is too unreliable. Got a cronjob on one of my servers posting the Github API instead now.
+  #schedule:
+  # - cron: '0 12 * * *'
 permissions:
   contents: write
 jobs:
